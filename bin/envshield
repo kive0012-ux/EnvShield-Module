@@ -1,0 +1,415 @@
+#!/system/bin/sh
+# ============================================================
+# EnvShield CLI
+# 用法：su -c 'sh /data/adb/modules/envshield/bin/envshield <命令>'
+# ============================================================
+
+ES_STAGE=cli
+
+SELF_DIR=${0%/*}
+case "$SELF_DIR" in
+    /*) ;;
+    *) SELF_DIR=$(cd "$SELF_DIR" 2>/dev/null && pwd) ;;
+esac
+MODDIR=${SELF_DIR%/*}
+[ -d "$MODDIR/common" ] || MODDIR=/data/adb/modules/envshield
+
+. "$MODDIR/common/util.sh"
+. "$MODDIR/common/props.sh"
+. "$MODDIR/common/traces.sh"
+. "$MODDIR/common/denylist.sh"
+
+mkdir -p "$ES_DIR" 2>/dev/null
+chmod 0700 "$ES_DIR" 2>/dev/null
+
+es_load_conf
+es_detect_impl
+
+VER=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null)
+
+ok()    { printf '  [ OK ]  %s\n' "$*"; }
+warn()  { printf '  [WARN]  %s\n' "$*"; WARN_N=$((WARN_N + 1)); }
+bad()   { printf '  [FAIL]  %s\n' "$*"; FAIL_N=$((FAIL_N + 1)); }
+info()  { printf '  [INFO]  %s\n' "$*"; }
+title() { printf '\n%s\n' "$*"; }
+
+WARN_N=0
+FAIL_N=0
+
+# ------------------------------------------------------------
+# status
+# ------------------------------------------------------------
+cmd_status() {
+    echo "EnvShield $VER"
+    echo "--------------------------------------------"
+    echo "  Root 实现   → $ES_ROOT_IMPL"
+    echo "  resetprop   → $([ "$ES_RP" != "" ] && echo "$ES_RP" || echo 不可用（依赖 system.prop）)"
+    echo "  SELinux     → $(getenforce 2>/dev/null)"
+    echo "  属性归一    → $([ "$ES_PROP_STRICT" = 1 ] && echo 开启 || echo 关闭) (aggressive=$ES_PROP_AGGRESSIVE spoof_boot=$ES_PROP_SPOOF_BOOT consistent=$ES_PROP_CONSISTENT)"
+    echo "  目标应用    → $(echo "$ES_TARGETS" | wc -w | tr -d ' ') 个"
+    echo "  看护        → $([ "$ES_WATCHDOG" = 1 ] && echo "开启 / ${ES_WATCH_INTERVAL}s" || echo 关闭)"
+    echo "  system.prop → $([ -f "$MODDIR/system.prop" ] && echo "$(grep -c . "$MODDIR/system.prop" 2>/dev/null) 条" || echo 未生成)"
+
+    _q=0
+    for _f in "$ES_QUAR"/*; do
+        [ -e "$_f" ] && _q=$((_q + 1))
+    done
+    echo "  隔离文件    → $_q 个"
+
+    echo "--------------------------------------------"
+    es_kernel_flags | sed 's/^/  /'
+    echo "--------------------------------------------"
+    echo "配置: $ES_CONF"
+    echo "日志: $ES_LOG"
+}
+
+# ------------------------------------------------------------
+# check
+# ------------------------------------------------------------
+_risk_list() {
+    cat <<'EOF'
+com.topjohnwu.magisk
+me.weishu.kernelsu
+com.rifsxd.ksunext
+me.bmax.apatch
+org.lsposed.manager
+de.robv.android.xposed.installer
+com.tsng.hidemyapplist
+eu.chainfire.supersu
+com.koushikdutta.superuser
+com.gameguardian
+com.cih.gamecih2
+bin.mt.plus
+com.termux
+EOF
+}
+
+cmd_check() {
+    echo "EnvShield $VER  环境自检"
+    echo "============================================"
+
+    # 1 SELinux
+    title "[1] SELinux 状态"
+    _st=$(getenforce 2>/dev/null)
+    case "$_st" in
+        Enforcing)  ok "Enforcing" ;;
+        Permissive) bad "Permissive —— 检测器的必查项，会被直接判定为已修改" ;;
+        *)          warn "无法读取 getenforce（$_st）" ;;
+    esac
+
+    # 2 属性
+    title "[2] 关键属性"
+    _bt=$(getprop ro.build.type)
+    _bg=$(getprop ro.build.tags)
+    _db=$(getprop ro.debuggable)
+    _se=$(getprop ro.secure)
+    _bs=$(getprop ro.build.selinux)
+    _fp=$(getprop ro.build.fingerprint)
+
+    [ "$_bt" = "user" ]         && ok "ro.build.type = user"         || warn "ro.build.type = $_bt"
+    [ "$_bg" = "release-keys" ] && ok "ro.build.tags = release-keys" || warn "ro.build.tags = $_bg"
+    [ "$_bs" = "" ]             && ok "ro.build.selinux 不存在"      || warn "ro.build.selinux = $_bs（泄露 SELinux 状态）"
+
+    if [ "$_se" = "1" ]; then
+        ok "ro.secure = 1"
+    elif [ "$ES_PROP_AGGRESSIVE" = 1 ]; then
+        warn "ro.secure = $_se（写入未生效，检查 resetprop 权限）"
+    else
+        warn "ro.secure = $_se —— 设 ES_PROP_AGGRESSIVE=1 可收敛"
+    fi
+
+    if [ "$_db" = "0" ]; then
+        ok "ro.debuggable = 0"
+    elif [ "$ES_PROP_AGGRESSIVE" = 1 ]; then
+        warn "ro.debuggable = $_db（写入未生效，检查 resetprop 权限）"
+    else
+        warn "ro.debuggable = $_db —— 设 ES_PROP_AGGRESSIVE=1 可收敛（会关掉 adb root）"
+    fi
+
+    # 一致性：改了 type/tags 却留下矛盾指纹，比不改更容易被识别
+    case "$_fp" in
+        *test-keys*|*dev-keys*|*:userdebug/*|*:eng/*)
+            bad "ro.build.fingerprint 与已归一的 type/tags 不一致"
+            info "执行 envshield apply 补齐（ES_PROP_CONSISTENT=1）"
+            ;;
+        *)
+            ok "ro.build.fingerprint 与 build.type/tags 自洽"
+            ;;
+    esac
+
+    _bad_tags=$(getprop 2>/dev/null |
+        sed -n 's/^\[\([^]]*build\.tags\)\]: \[\(test-keys\|dev-keys\)\]$/\1/p' |
+        head -n 3 | tr '\n' ' ')
+    if [ -n "$_bad_tags" ]; then
+        warn "分区的 build.tags 未归一：$_bad_tags"
+    fi
+
+    # 3 挂载
+    title "[3] 挂载痕迹（root 命名空间）"
+    _mnt=$(es_scan_mounts)
+    _mc=$(echo "$_mnt" | grep -c . 2>/dev/null)
+    if [ "${_mc:-0}" -eq 0 ]; then
+        ok "当前进程视角未见模块挂载"
+    else
+        warn "当前 root 命名空间可见 $_mc 条模块挂载（root 视角正常）"
+        echo "$_mnt" | head -n 3 | sed 's/^/          /'
+        info "判断隐藏是否成功，要看普通应用进程：需要 Shamiko / Zygisk Assistant / SUSFS 做 mount 隔离"
+    fi
+
+    # 4 临时目录
+    title "[4] /data/local/tmp"
+    _elf=0
+    _sus=0
+    for _f in /data/local/tmp/* /data/local/tmp/.[!.]*; do
+        [ -e "$_f" ] || continue
+        [ -d "$_f" ] && continue
+        [ -L "$_f" ] && continue
+        if es_is_elf "$_f"; then
+            _elf=$((_elf + 1))
+            [ "$_elf" -le 3 ] && echo "          ELF: $_f"
+        fi
+        es_is_suspect_name "${_f##*/}" && _sus=$((_sus + 1))
+    done
+    if [ "$_elf" -eq 0 ] && [ "$_sus" -eq 0 ]; then
+        ok "无 ELF 可执行文件 / 无已知工具名"
+    else
+        bad "ELF $_elf 个，已知工具名 $_sus 个 —— 会被『临时目录 Root 二进制』命中"
+        info "执行 envshield clean 隔离它们"
+    fi
+
+    # 5 Root 路径
+    title "[5] Root 相关路径（root 可见，检测器拿到 root 也能看到）"
+    _paths=$(es_scan_risk_paths)
+    _pc=$(echo "$_paths" | grep -c . 2>/dev/null)
+    if [ "${_pc:-0}" -eq 0 ]; then
+        ok "未发现常见路径"
+    else
+        warn "存在 $_pc 个路径（这是 Root 本身所在，无法删除，只能靠内核层隐藏）"
+        echo "$_paths" | head -n 5 | sed 's/^/          /'
+    fi
+
+    # 6 风险应用
+    title "[6] 已安装应用（包名清单核对）"
+    if command -v pm >/dev/null 2>&1; then
+        pm list packages 2>/dev/null | sed 's/^package://' | sort > "$ES_DIR/.pkgs"
+        { _risk_list; echo "$ES_RISK_PKGS" | tr ' ' '\n'; } | sed '/^$/d' | sort -u > "$ES_DIR/.risk"
+        _hit=$(grep -Fxf "$ES_DIR/.risk" "$ES_DIR/.pkgs" 2>/dev/null)
+        rm -f "$ES_DIR/.pkgs" "$ES_DIR/.risk"
+        if [ -z "$_hit" ]; then
+            ok "未命中内置风险清单"
+        else
+            bad "命中 $(echo "$_hit" | grep -c .) 个："
+            echo "$_hit" | sed 's/^/          /'
+            info "包名清单只能靠 HMA(Hide My Applist) 这类方案隐藏，模块层做不到"
+        fi
+    else
+        warn "无 pm 命令，跳过"
+    fi
+
+    # 7 内核
+    title "[7] 内核特征"
+    _kf=$(es_kernel_flags)
+    echo "$_kf" | sed 's/^/          /'
+    if echo "$_kf" | grep -q 'lkm_loaded: yes'; then
+        bad "KernelSU 以 LKM 形式加载 —— 侧信道可稳定判定，用户态无法隐藏"
+        info "唯一解法：换带 SUSFS 的内核（KernelSU-Next + SUSFS），或改用内核内置方案"
+    else
+        ok "未发现 KSU 模块加载痕迹"
+    fi
+    echo "$_kf" | grep -q 'susfs: yes' && ok "内核带 SUSFS" || warn "内核不带 SUSFS（内核层隐藏能力缺失）"
+
+    # 8 组件
+    title "[8] 隐藏组件"
+    _comp=$(es_component_status)
+    if [ -z "$_comp" ]; then
+        warn "未检测到 Zygisk Next / Shamiko / TrickyStore / HMA"
+    else
+        echo "$_comp" | sed 's/^/          /'
+    fi
+    echo "          zygisk 开关: $(es_zygisk_state)"
+
+    # 9 目标
+    title "[9] 目标应用登记"
+    if [ -z "$ES_TARGETS" ]; then
+        warn "ES_TARGETS 为空，没有应用被隔离"
+    else
+        for _p in $ES_TARGETS; do
+            if [ "$ES_ROOT_IMPL" = "magisk" ]; then
+                if magisk --denylist ls 2>/dev/null | grep -q "$_p"; then
+                    ok "$_p 已在 DenyList"
+                else
+                    warn "$_p 未确认在 DenyList"
+                fi
+            else
+                info "$_p（请在管理器中确认已开启『卸载模块』）"
+            fi
+        done
+    fi
+
+    # 总结
+    echo "============================================"
+    echo "自检结果：$FAIL_N 项危险，$WARN_N 项待处理"
+    if [ "$FAIL_N" -eq 0 ] && [ "$WARN_N" -eq 0 ]; then
+        echo "用户态层面已无明显破绽。"
+    else
+        echo "按上面 [INFO] 的建议逐项处理。"
+    fi
+    echo
+    echo "提醒：本模块只处理用户态可见部分。若 [7] 判为 LKM，"
+    echo "      任何模块都无法让它在侧信道检测下消失。"
+}
+
+# ------------------------------------------------------------
+# apply / clean / sync
+# ------------------------------------------------------------
+cmd_apply() {
+    echo "应用配置 ..."
+    es_apply_props
+    echo "  基础属性: $ES_CHANGED 项"
+    es_apply_consistency
+    echo "  一致性归一: 完成"
+    es_selinux_enforce
+    echo "  SELinux : $(getenforce 2>/dev/null)"
+    es_apply_targets
+    echo "  目标登记: $(echo "$ES_TARGETS" | wc -w | tr -d ' ') 个"
+    es_clean_tmp
+    echo "  隔离文件: $ES_QUAR_COUNT 个"
+
+    if es_sync_system_prop; then
+        echo "  system.prop: 已同步（KernelSU/APatch 重启后生效）"
+    else
+        echo "  system.prop: 未同步（无写入权限）"
+    fi
+
+    [ -n "$ES_TARGETS" ] && [ "$ES_ROOT_IMPL" = "kernelsu" ] &&
+        echo "  提示: KernelSU 请在管理器中为这些应用开启『卸载模块』"
+    echo "完成。"
+}
+
+cmd_clean() {
+    es_clean_tmp
+    echo "已隔离 $ES_QUAR_COUNT 个文件 -> $ES_QUAR"
+}
+
+cmd_sync() {
+    if es_sync_system_prop; then
+        echo "已生成 $MODDIR/system.prop（重启后生效）"
+        echo "  行数: $(grep -c . "$MODDIR/system.prop" 2>/dev/null)"
+    else
+        echo "生成 system.prop 失败"
+        return 1
+    fi
+}
+
+# ------------------------------------------------------------
+# targets
+# ------------------------------------------------------------
+_set_targets() {
+    _new="ES_TARGETS=\"$1\""
+    if [ -f "$ES_CONF" ]; then
+        grep -v '^ES_TARGETS=' "$ES_CONF" > "$ES_CONF.tmp" 2>/dev/null
+        printf '%s\n' "$_new" >> "$ES_CONF.tmp"
+        mv -f "$ES_CONF.tmp" "$ES_CONF" 2>/dev/null
+        chmod 0600 "$ES_CONF" 2>/dev/null
+    else
+        printf '%s\n' "$_new" > "$ES_CONF"
+    fi
+    es_load_conf
+}
+
+cmd_targets() {
+    _act=$1
+    shift
+    case "$_act" in
+        add)
+            for _p in "$@"; do
+                es_valid_pkg "$_p" || { echo "包名不合法: $_p"; continue; }
+                case " $ES_TARGETS " in
+                    *" $_p "*) ;;
+                    *) ES_TARGETS="$ES_TARGETS $_p" ;;
+                esac
+            done
+            ES_TARGETS=$(echo "$ES_TARGETS" | sed 's/^ *//;s/ *$//')
+            _set_targets "$ES_TARGETS"
+            es_apply_targets
+            echo "当前目标: $ES_TARGETS"
+            ;;
+        del)
+            _keep=""
+            for _p in $ES_TARGETS; do
+                _drop=0
+                for _d in "$@"; do
+                    [ "$_p" = "$_d" ] && _drop=1
+                done
+                [ "$_drop" = 0 ] && _keep="$_keep $_p"
+            done
+            ES_TARGETS=$(echo "$_keep" | sed 's/^ *//;s/ *$//')
+            _set_targets "$ES_TARGETS"
+            echo "当前目标: ${ES_TARGETS:-（空）}"
+            echo "注: Magisk DenyList 内的旧条目不会自动移除，可在 Magisk 设置里手动清理。"
+            ;;
+        *)
+            echo "当前目标: ${ES_TARGETS:-（空）}"
+            echo
+            echo "用法: envshield targets add <包名> [包名...]"
+            echo "      envshield targets del <包名>"
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------
+# 其他
+# ------------------------------------------------------------
+cmd_log() {
+    tail -n "${1:-40}" "$ES_LOG" 2>/dev/null || echo "暂无日志"
+}
+
+cmd_quarantine() {
+    if [ "$1" = "restore" ]; then
+        _n=0
+        for _f in "$ES_QUAR"/*; do
+            [ -e "$_f" ] || continue
+            _base=${_f##*/}
+            _name=${_base%.*}
+            [ -n "$_name" ] || _name=$_base
+            _dst="/data/local/tmp/$_name"
+            [ -e "$_dst" ] && _dst="$_dst.restored.$(date +%s)"
+            mv -f "$_f" "$_dst" 2>/dev/null && _n=$((_n + 1))
+        done
+        echo "已还原 $_n 个文件"
+    else
+        ls -lh "$ES_QUAR" 2>/dev/null || echo "隔离区为空"
+    fi
+}
+
+usage() {
+    cat <<EOF
+EnvShield $VER
+
+  status                环境概览
+  check                 逐项自检（模拟常见检测项）
+  apply                 重新应用属性 / 一致性归一 / 加白 / 清理
+  sync                  按当前配置重新生成 system.prop（重启生效）
+  clean                 只清理 /data/local/tmp
+  targets [add|del]     管理需要隐藏 Root 的应用
+  quarantine [restore]  查看 / 还原被隔离的文件
+  log [行数]             查看日志
+
+配置文件: $ES_CONF
+EOF
+}
+
+case "$1" in
+    status)        cmd_status ;;
+    check|audit)   cmd_check ;;
+    apply|fix)     cmd_apply ;;
+    sync)          cmd_sync ;;
+    clean)         cmd_clean ;;
+    targets)       shift; cmd_targets "$@" ;;
+    quarantine|q)  shift; cmd_quarantine "$@" ;;
+    log)           shift; cmd_log "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *)             echo "未知命令: $1"; echo; usage ;;
+esac
+
+exit 0
