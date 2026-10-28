@@ -4,4 +4,4 @@ version=v1.1.0
 versionCode=11000
 author=EnvShield
 description=Root 暴露面收敛：属性归一 + 环境一致性 + 痕迹隔离 + 自动加白 + 环境自检。纯用户态实现，不挂载 system 分区，Magisk / KernelSU / APatch 通用。
-updateJson=UPDATE_JSON_URL_PLACEHOLDER
+updateJson=https://raw.githubusercontent.com/kive0012-ux/EnvShield-Module/main/update.json
